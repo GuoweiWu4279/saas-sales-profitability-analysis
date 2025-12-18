@@ -42,7 +42,7 @@ product_summary = (
 )
 
 # Calculate profit margin
-product_summary["profit_margin_pct"] = product_summary["Profit"] / product_summary["Sales"] * 100
+product_summary["profit_margin_pct"] = product_summary["Profit"] / product_summary["Sales"]
 # Sort by Profit (from highest to lowest)
 product_summary = product_summary.sort_values(by="Profit", ascending=False)
 
@@ -65,7 +65,7 @@ region_summary = (
 )
 
 # Calculate profit margin for each region
-region_summary["profit_margin_pct"] = region_summary["Profit"]/region_summary["Sales"] * 100
+region_summary["profit_margin_pct"] = region_summary["Profit"]/region_summary["Sales"]
 # Sort by total profit
 region_profit_sorted = region_summary.sort_values(by="Profit", ascending=False)
 
@@ -89,7 +89,7 @@ region_product_summary = (
 )
 
 # Calculate profit margin
-region_product_summary["profit_margin_pct"] = (region_product_summary["Profit"] / region_product_summary["Sales"] * 100)
+region_product_summary["profit_margin_pct"] = (region_product_summary["Profit"] / region_product_summary["Sales"])
 # Focus on APJ only
 apj_products = region_product_summary[region_product_summary["Region"] == "APJ"]
 #Basic scan of raw data
