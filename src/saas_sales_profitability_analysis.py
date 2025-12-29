@@ -119,3 +119,31 @@ region_product_summary.to_csv("output/region_product_summary.csv", index=False)
 
 print("\n===== CSV FILES EXPORTED TO TABLEAU =====")
 
+#---------------------------------------------------------------------------------------------------
+# Step D: Add indicators and ratios to identify key issue and trends.
+
+#Create two indicators, revenue per unit and profit per unit
+product_summary["revenue_per_unit"] = product_summary["Sales"] / product_summary["Quantity"]
+product_summary["Profit_per_unit"] = product_summary["Profit"] / product_summary["Quantity"]
+
+#Calculate APJ loss contribution
+apj_loss_products = apj_products[apj_products["Profit"] < 0].copy()
+
+apj_loss_products["loss_contribution_pct"] = (
+    apj_loss_products["Profit"].abs() / apj_loss_products["Profit"].abs().sum()
+)
+
+apj_loss_products = apj_loss_products.sort_values(
+    by="loss_contribution_pct", ascending=False
+)
+
+apj_loss_products["cumulative_loss_pct"] = (
+    apj_loss_products["loss_contribution_pct"].cumsum()
+)
+
+print("\n===== APJ LOSS CONCENTRATION (TOP PRODUCTS) =====")
+print(
+    apj_loss_products[
+        ["Product", "Profit", "loss_contribution_pct", "cumulative_loss_pct"]
+    ].head(5).to_string(index=False)
+)
