@@ -20,15 +20,21 @@ from datetime import datetime
 
 def load_csv(csv_path):
     df = pd.read_csv(csv_path, dtype=str).fillna("")
-    # 统一列名（容忍大小写、空格差异）
     df.columns = [c.strip().upper().replace(" ", "_") for c in df.columns]
-    required = "PO_NUMBER"
-    if required not in df.columns:
-        # 兼容 "NUMBER" 列名
+
+    # 兼容 "NUMBER" 或 "PO" 列名
+    if "PO_NUMBER" not in df.columns:
         if "NUMBER" in df.columns:
             df = df.rename(columns={"NUMBER": "PO_NUMBER"})
+        elif "PO" in df.columns:
+            df = df.rename(columns={"PO": "PO_NUMBER"})
         else:
             sys.exit(f"CSV 里找不到 PO 号列。实际列名：{list(df.columns)}")
+
+    # nexonia_full_scraper 输出的是 cost_center 列，直接用作 Program Code
+    if "COST_CENTER" in df.columns and "PROGRAM_CODE" not in df.columns:
+        df = df.rename(columns={"COST_CENTER": "PROGRAM_CODE"})
+
     return df
 
 
