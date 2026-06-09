@@ -6,6 +6,14 @@ output/.scrape_progress.json
 output/diagnostic_*.json
 output/diagnostic_*.png
 
+# 含人员/PO 敏感数据，不要提交
+PO_Review*.xlsx
+PO_Review*.xls
+program_reviewers.csv
+output/Nexonia_POs_*.csv
+output/PO_Tracking_*.xlsx
+output/emails/
+
 # Python
 __pycache__/
 *.pyc
