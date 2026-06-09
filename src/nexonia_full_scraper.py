@@ -196,6 +196,51 @@ def main():
         print("="*60)
         input("准备好后按 Enter，脚本自动开始 ▶ ")
 
+        # ── 诊断：找到正确的 frame ────────────────────────────────────────
+        print("\n  分析页面结构，找可用 frame…")
+        time.sleep(1)
+
+        target_frame = None
+        for frame in page.frames:
+            try:
+                diag = frame.evaluate("""
+                    () => ({
+                        url:     location.href,
+                        trs:     document.querySelectorAll('tr').length,
+                        tables:  document.querySelectorAll('table').length,
+                        sample:  [...document.querySelectorAll('tr td')].slice(0,6)
+                                  .map(t => t.innerText.trim()).join(' | '),
+                    })
+                """)
+                has_po = bool(re.search(r'\b\d{4,6}\b', diag.get('sample', '')))
+                print(f"    frame: {diag['url'][:80]}  "
+                      f"tables={diag['tables']} trs={diag['trs']} "
+                      f"{'← 有PO数据' if has_po else ''}")
+                if diag['trs'] > 2 and has_po:
+                    target_frame = frame
+                    print(f"    → 使用此 frame")
+                    break
+            except Exception:
+                pass
+
+        if target_frame is None:
+            # 没找到含 PO 的 frame，dump 所有 frame 内容帮助诊断
+            print("\n❌ 找不到含PO数据的 frame。页面结构诊断：")
+            for frame in page.frames:
+                try:
+                    info = frame.evaluate("""
+                        () => ({
+                            url: location.href,
+                            bodyText: document.body?.innerText?.slice(0,300) ?? ''
+                        })
+                    """)
+                    print(f"  [{info['url'][:60]}]")
+                    print(f"  文字预览: {info['bodyText'][:200]}")
+                except Exception:
+                    pass
+            browser.close()
+            return
+
         # ── Phase 1: 收集所有页面的 PO 基础信息 ──────────────────────────
         all_po_info = []
         page_num = 0
@@ -204,40 +249,32 @@ def main():
             page_num += 1
             print(f"\n  读取列表第 {page_num} 页…")
 
-            # 等页面完全稳定，最多尝试3次
-            for _ in range(3):
-                try:
-                    page.wait_for_load_state("load", timeout=15000)
-                    page.wait_for_load_state("networkidle", timeout=10000)
-                    break
-                except PWTimeout:
-                    pass
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except PWTimeout:
+                pass
 
-            # evaluate 失败时（页面跳转中）自动重试
+            # evaluate 失败时自动重试
             result = None
             for attempt in range(4):
                 try:
-                    result = page.evaluate(LIST_EXTRACTOR_JS)
+                    result = target_frame.evaluate(LIST_EXTRACTOR_JS)
                     break
                 except Exception as e:
                     if "navigation" in str(e).lower() or "context" in str(e).lower():
-                        print(f"     页面还在加载，等待后重试（{attempt+1}/4）…")
+                        print(f"     等待页面稳定，重试（{attempt+1}/4）…")
                         time.sleep(2)
-                        try:
-                            page.wait_for_load_state("networkidle", timeout=8000)
-                        except PWTimeout:
-                            pass
                     else:
                         raise
 
             if result is None:
-                print("❌ 多次重试后仍无法读取页面，请确认已在PO列表页。")
+                print("❌ 多次重试后仍无法读取页面。")
                 browser.close()
                 return
 
             if "error" in result:
                 if page_num == 1:
-                    print(f"❌ 读不到PO表格。请确认你在PO列表页。")
+                    print(f"❌ 读不到PO表格。")
                     print(f"   检测到的表头：{result.get('cols', [])}")
                     browser.close()
                     return
@@ -249,7 +286,7 @@ def main():
                 break
             all_po_info.extend(batch)
 
-            # 找"下一页"按钮
+            # 找"下一页"按钮（在 frame 里找）
             next_btn = None
             for selector in [
                 "a[aria-label='Next page']",
@@ -260,7 +297,7 @@ def main():
                 "a:has-text('»')",
             ]:
                 try:
-                    btn = page.query_selector(selector)
+                    btn = target_frame.query_selector(selector)
                     if btn and btn.is_visible() and btn.is_enabled():
                         next_btn = btn
                         break
