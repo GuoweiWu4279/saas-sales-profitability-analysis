@@ -6,7 +6,7 @@
 ## 一次性安装
 
 ```powershell
-pip install playwright openpyxl pandas
+pip install playwright openpyxl pandas Pillow pypdf
 playwright install chromium
 ```
 
@@ -43,6 +43,34 @@ python src/process_po_csv.py output/Nexonia_POs_2026-06.csv
 - 会报告：
   - 同一 code 多条不一致的（已取最后一条，让你核对）
   - 映射表里找不到的 code（需要你去主文件补上）
+
+---
+
+### 第 3 步：审批后 — 存 PDF + 下载附件 + 合并
+
+```powershell
+python src/po_pdf_workflow.py 77033 77034 77035
+```
+
+或者一次处理当月所有 PO：
+
+```powershell
+python src/po_pdf_workflow.py --all
+```
+
+- 浏览器自动打开，进入 Approvals 列表页后按 Enter
+- 脚本自动：
+  - 点开每个 PO 弹窗
+  - 把页面（含弹窗）存成 PDF，文件名格式 `77033, ACBFHome01.pdf`
+  - 下载弹窗里所有附件（backup PDF）
+  - 把 PO PDF + 附件合并成一个最终文件
+- 输出：`output/pdfs/77033, ACBFHome01.pdf`
+
+**调试附件扫描**（如果附件没被找到，先用这个确认页面结构）：
+
+```powershell
+python src/po_pdf_workflow.py --scan 77033
+```
 
 ---
 

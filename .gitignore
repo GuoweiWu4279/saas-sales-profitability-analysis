@@ -13,6 +13,7 @@ program_reviewers.csv
 output/Nexonia_POs_*.csv
 output/PO_Tracking_*.xlsx
 output/emails/
+output/pdfs/
 
 # Python
 __pycache__/
