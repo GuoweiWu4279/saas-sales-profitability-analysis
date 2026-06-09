@@ -202,6 +202,15 @@ def build_records(leaves):
 # ─────────────────────────────────────────────────────────────────────────────
 # 弹窗详情：从明细行的 "Cost Center" 列读 Program Code
 # ─────────────────────────────────────────────────────────────────────────────
+def extract_code(raw):
+    """Cost Center 显示为 '代码 - 代码 - 名称'，取第一段作为 Program Code。
+    例：'RRHAC001 - RRHAC001 - AC Calworks' → 'RRHAC001'
+        'ACFlexBHSM01 - ACFlexBHSM01 - ...' → 'ACFlexBHSM01'
+    """
+    first = re.split(r"\s+[-–—]\s+", raw.strip())[0].strip()
+    return first if is_valid_code(first) else None
+
+
 def find_cost_center(leaves):
     # 找所有 "Cost Center" 列表头位置
     headers = [(lf["x"], lf["y"]) for lf in leaves
@@ -212,13 +221,13 @@ def find_cost_center(leaves):
     found = []
     for hx, hy in headers:
         for lf in leaves:
-            if not (hy + 5 < lf["y"] < hy + 280):
+            if not (hy + 5 < lf["y"] < hy + 320):
                 continue
             if abs(lf["x"] - hx) > 90:
                 continue
-            t = lf["t"].strip()
-            if is_valid_code(t):
-                found.append((lf["y"], t))
+            code = extract_code(lf["t"])
+            if code:
+                found.append((lf["y"], code))
 
     # 按出现顺序去重
     seen, out = set(), []
