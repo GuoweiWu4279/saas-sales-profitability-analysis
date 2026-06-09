@@ -204,12 +204,36 @@ def main():
             page_num += 1
             print(f"\n  读取列表第 {page_num} 页…")
 
-            try:
-                page.wait_for_load_state("networkidle", timeout=8000)
-            except PWTimeout:
-                pass
+            # 等页面完全稳定，最多尝试3次
+            for _ in range(3):
+                try:
+                    page.wait_for_load_state("load", timeout=15000)
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                    break
+                except PWTimeout:
+                    pass
 
-            result = page.evaluate(LIST_EXTRACTOR_JS)
+            # evaluate 失败时（页面跳转中）自动重试
+            result = None
+            for attempt in range(4):
+                try:
+                    result = page.evaluate(LIST_EXTRACTOR_JS)
+                    break
+                except Exception as e:
+                    if "navigation" in str(e).lower() or "context" in str(e).lower():
+                        print(f"     页面还在加载，等待后重试（{attempt+1}/4）…")
+                        time.sleep(2)
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=8000)
+                        except PWTimeout:
+                            pass
+                    else:
+                        raise
+
+            if result is None:
+                print("❌ 多次重试后仍无法读取页面，请确认已在PO列表页。")
+                browser.close()
+                return
 
             if "error" in result:
                 if page_num == 1:
