@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-Nexonia 全自动 PO 抓取器（几何坐标版）
-=====================================
-不依赖网页的 HTML 结构（即使数据"像按钮"无法复制也能抓），
-而是读取页面上每个文字的屏幕坐标(x, y)，像拍照一样还原出表格。
+Nexonia 全自动 PO 抓取器（几何坐标版 v2）
+=========================================
+读取页面上每个文字/表单控件的屏幕坐标(x, y)，像拍照一样还原出表格，
+不依赖网页 HTML 结构（即使数据"像按钮"也能抓）。
+
+工作流程：
+  Phase 1  一次性读取整个 PO 列表（PO号、日期、供应商、金额、Memo）
+  Phase 2  逐个点开 PO 弹窗，从明细行的 "Cost Center" 列读出 Program Code，
+           读完按 Esc 关闭弹窗，再开下一个
 
 特点：
-  • 登录一次，永久记住 —— 用持久化浏览器，下次跑不用重新登录/导航
-  • 失败绝不关浏览器 —— 出错就停下让你看，浏览器留着
-  • 自动滚动加载所有行
-  • 中途中断可续抓（断点缓存）
+  • 登录一次永久记住（持久化浏览器，下次免登录/免导航）
+  • 失败绝不关浏览器，停下让你看 + 转储诊断
+  • 自动重试缓存里没拿到有效 Code 的 PO
 
 安装（只需一次）：
     pip install playwright
@@ -41,32 +45,57 @@ NEXONIA_BASE  = "https://a.na1.system.nexonia.com"
 SESSION_DIR   = os.path.abspath(".nexonia_session")   # 登录信息保存在这里
 PROGRESS_FILE = "output/.scrape_progress.json"
 
+# Program Code（Cost Center 值）的样子：字母开头、含数字、无空格，如 ACFlexMHSA01.1 / GH001.6
+CODE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9./\-]*\d[A-Za-z0-9./\-]*$")
+
+
+def is_valid_code(s):
+    return bool(s) and " " not in s and bool(CODE_RE.match(s.strip()))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# JS：采集页面上所有"叶子"文字 + 它们的屏幕坐标
-# （叶子 = 直接含文字的元素，坐标用绝对坐标 scrollY 以便跨滚动去重）
+# JS：采集页面上所有"叶子"文字 + 表单控件的值 + 屏幕坐标
 # ─────────────────────────────────────────────────────────────────────────────
 LEAF_COLLECTOR_JS = r"""
 () => {
     const out = [];
-    const els = document.querySelectorAll('body *');
-    for (const el of els) {
-        // 只取该元素"直接"包含的文字（不含子元素的文字），避免重复
+    const push = (txt, el, isForm) => {
+        txt = (txt || '').replace(/\s+/g, ' ').trim();
+        if (!txt) return;
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return;
+        out.push({
+            t: txt,
+            x: Math.round(r.left),
+            y: Math.round(r.top + window.scrollY),
+            f: !!isForm,
+        });
+    };
+
+    for (const el of document.querySelectorAll('body *')) {
+        const tag = el.tagName;
+
+        // 表单控件：读它显示的值（下拉框读选中项文字）
+        if (tag === 'INPUT') {
+            if (el.type !== 'hidden' && el.type !== 'checkbox' && el.value) push(el.value, el, true);
+            continue;
+        }
+        if (tag === 'TEXTAREA') {
+            if (el.value) push(el.value, el, true);
+            continue;
+        }
+        if (tag === 'SELECT') {
+            const o = el.options[el.selectedIndex];
+            if (o && o.text) push(o.text, el, true);
+            continue;
+        }
+
+        // 普通元素：只取直接文字（不含子元素），避免重复
         let direct = '';
         for (const n of el.childNodes) {
             if (n.nodeType === 3) direct += n.textContent;
         }
-        direct = direct.replace(/\s+/g, ' ').trim();
-        if (!direct) continue;
-
-        const r = el.getBoundingClientRect();
-        if (r.width === 0 || r.height === 0) continue;
-
-        out.push({
-            t: direct,
-            x: Math.round(r.left),
-            y: Math.round(r.top + window.scrollY),
-        });
+        push(direct, el, false);
     }
     return {
         leaves: out,
@@ -76,9 +105,16 @@ LEAF_COLLECTOR_JS = r"""
 }
 """
 
+# 不属于数据的"页面框架"文字，列表还原时排除
+CHROME_WORDS = {
+    "EXPENSES", "PURCHASING", "APPROVALS", "REPORTING", "ADD FILTER", "REFRESH",
+    "APPROVE", "REJECT", "ACTION", "NUMBER", "CREATION DATE", "VENDOR",
+    "APPROVER", "MEMO", "TOTAL AMOUNT", "ABODE SERVICES", "PRIVACY POLICY",
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 把"文字+坐标"还原成表格记录
+# 列表还原：把"文字+坐标"还原成表格记录
 # ─────────────────────────────────────────────────────────────────────────────
 HEADER_ALIASES = {
     "ACTION":   ["ACTION"],
@@ -120,7 +156,6 @@ def build_records(leaves):
         return None, colx
 
     num_x = colx["NUMBER"]
-    # PO 号 = 表头下方、横坐标接近 NUMBER 列、且是 4-6 位数字
     po_leaves = [
         lf for lf in leaves
         if lf["y"] > header_y + 5
@@ -129,7 +164,6 @@ def build_records(leaves):
     ]
     po_leaves.sort(key=lambda l: l["y"])
 
-    # 跨滚动会有重复 PO，按 PO 号去重保留最先出现的
     seen, uniq = set(), []
     for lf in po_leaves:
         if lf["t"] not in seen:
@@ -144,8 +178,11 @@ def build_records(leaves):
 
         cells = defaultdict(list)
         for lf in leaves:
-            if y0 <= lf["y"] < y1:
-                cells[nearest_col(lf["x"], colx)].append((lf["y"], lf["x"], lf["t"]))
+            if not (y0 <= lf["y"] < y1):
+                continue
+            if lf["t"].upper() in CHROME_WORDS:   # 排除导航/表头噪声
+                continue
+            cells[nearest_col(lf["x"], colx)].append((lf["y"], lf["x"], lf["t"]))
 
         def gather(col):
             items = sorted(cells.get(col, []))
@@ -162,81 +199,47 @@ def build_records(leaves):
     return records, colx
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 弹窗详情：从明细行的 "Cost Center" 列读 Program Code
+# ─────────────────────────────────────────────────────────────────────────────
 def find_cost_center(leaves):
-    """在详情视图里按标签找 Cost Center 的值（标签右边或下方）。"""
-    LABELS = ["COST CENTER", "PROGRAM", "PROGRAM CODE", "PROJECT", "PROJECT CODE", "FUND"]
+    # 找所有 "Cost Center" 列表头位置
+    headers = [(lf["x"], lf["y"]) for lf in leaves
+               if lf["t"].strip().upper() == "COST CENTER"]
+    if not headers:
+        return None
 
-    def is_label(txt):
-        return txt.upper().rstrip(":").strip() in LABELS
+    found = []
+    for hx, hy in headers:
+        for lf in leaves:
+            if not (hy + 5 < lf["y"] < hy + 280):
+                continue
+            if abs(lf["x"] - hx) > 90:
+                continue
+            t = lf["t"].strip()
+            if is_valid_code(t):
+                found.append((lf["y"], t))
 
-    for lf in leaves:
-        if not is_label(lf["t"]):
-            continue
-        ly, lx = lf["y"], lf["x"]
-
-        # 右边同一行
-        right = sorted(
-            [o for o in leaves if abs(o["y"] - ly) < 16 and o["x"] > lx + 5 and o["t"].strip()],
-            key=lambda o: o["x"],
-        )
-        for o in right:
-            if not is_label(o["t"]):
-                return o["t"]
-
-        # 正下方
-        below = sorted(
-            [o for o in leaves if 0 < o["y"] - ly < 45 and abs(o["x"] - lx) < 140 and o["t"].strip()],
-            key=lambda o: o["y"],
-        )
-        for o in below:
-            if not is_label(o["t"]):
-                return o["t"]
-    return None
+    # 按出现顺序去重
+    seen, out = set(), []
+    for _, t in sorted(found):
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return ";".join(out) if out else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 滚动采集：滚到底，沿途收集所有叶子（应对懒加载/虚拟滚动）
+# 找含 PO 表格的 frame（多数情况就是主页面）
 # ─────────────────────────────────────────────────────────────────────────────
-def collect_all_leaves(target):
-    all_leaves, seen = [], set()
-
-    def grab():
-        data = target.evaluate(LEAF_COLLECTOR_JS)
-        for lf in data["leaves"]:
-            key = (lf["t"], lf["x"], lf["y"])
-            if key not in seen:
-                seen.add(key)
-                all_leaves.append(lf)
-        return data
-
-    data = grab()
-    last_h, stable = 0, 0
-    for _ in range(60):  # 最多滚 60 屏
-        target.evaluate("window.scrollBy(0, Math.round(window.innerHeight * 0.85))")
-        time.sleep(0.4)
-        data = grab()
-        h = data["scrollHeight"]
-        if h == last_h:
-            stable += 1
-            if stable >= 2:
-                break
-        else:
-            stable = 0
-        last_h = h
-
-    target.evaluate("window.scrollTo(0, 0)")
-    time.sleep(0.2)
-    return all_leaves
+def grab(target):
+    return target.evaluate(LEAF_COLLECTOR_JS)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 找到含 PO 表格的 frame（多数情况就是主页面）
-# ─────────────────────────────────────────────────────────────────────────────
 def find_target(page):
-    candidates = [page] + list(page.frames)
-    for t in candidates:
+    for t in [page] + list(page.frames):
         try:
-            data = t.evaluate(LEAF_COLLECTOR_JS)
+            data = grab(t)
             leaves = data["leaves"]
             colx, _ = locate_columns(leaves)
             has_num = any(re.fullmatch(r"\d{4,6}", lf["t"]) for lf in leaves)
@@ -245,6 +248,19 @@ def find_target(page):
         except Exception:
             pass
     return None
+
+
+def capture_list(target):
+    """列表一次性全部渲染（非虚拟滚动）。先滚到底触发懒加载，回到顶部再单次采集，
+    避免固定表头/导航在滚动中产生重影污染。"""
+    try:
+        target.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        time.sleep(0.6)
+        target.evaluate("window.scrollTo(0, 0)")
+        time.sleep(0.3)
+    except Exception:
+        pass
+    return grab(target)["leaves"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -263,9 +279,6 @@ def save_progress(data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 诊断转储：抓不到时把页面结构存下来供分析
-# ─────────────────────────────────────────────────────────────────────────────
 def dump_diagnostics(page):
     os.makedirs("output", exist_ok=True)
     try:
@@ -275,19 +288,44 @@ def dump_diagnostics(page):
         pass
     for i, fr in enumerate([page] + list(page.frames)):
         try:
-            data = fr.evaluate(LEAF_COLLECTOR_JS)
+            data = grab(fr)
             leaves = data["leaves"]
             colx, _ = locate_columns(leaves)
-            sample = [lf["t"] for lf in leaves[:40]]
-            print(f"   frame[{i}] {fr.url[:70]}  文字块={len(leaves)} 识别到的列={list(colx)}")
-            if i == 0 or colx:
-                with open(f"output/diagnostic_frame_{i}.json", "w", encoding="utf-8") as f:
-                    json.dump({"url": fr.url, "columns": colx, "leaves": leaves},
-                              f, ensure_ascii=False, indent=2)
-                print(f"     详细文字+坐标已存：output/diagnostic_frame_{i}.json")
-            print(f"     前40个文字块：{sample}")
+            print(f"   frame[{i}] {fr.url[:70]}  文字块={len(leaves)} 列={list(colx)}")
+            with open(f"output/diagnostic_frame_{i}.json", "w", encoding="utf-8") as f:
+                json.dump({"url": fr.url, "columns": colx, "leaves": leaves},
+                          f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"   frame[{i}] 读取失败：{e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 弹窗：打开 / 关闭
+# ─────────────────────────────────────────────────────────────────────────────
+def close_modal(page, target):
+    """关闭 PO 详情弹窗，确保回到列表。"""
+    for _ in range(3):
+        # 弹窗已关？
+        try:
+            if target.get_by_text("Order Details", exact=False).count() == 0:
+                return True
+        except Exception:
+            return True
+        # 先试 Esc
+        try:
+            page.keyboard.press("Escape")
+            time.sleep(0.4)
+        except Exception:
+            pass
+        # 再试点 Close
+        try:
+            btn = target.get_by_text("Close", exact=True).first
+            if btn.is_visible():
+                btn.click(timeout=1500)
+                time.sleep(0.4)
+        except Exception:
+            pass
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -296,15 +334,16 @@ def dump_diagnostics(page):
 def main():
     os.makedirs("output", exist_ok=True)
     progress = load_progress()
+    valid_cached = sum(1 for v in progress.values() if is_valid_code(v.get("cost_center", "")))
     if progress:
-        print(f"发现断点缓存：{len(progress)} 个PO已完成，将自动跳过。")
+        print(f"发现断点缓存：{len(progress)} 个，其中 {valid_cached} 个已有有效 Code（会跳过），"
+              f"其余会自动重试。")
 
     with sync_playwright() as p:
-        # 持久化浏览器：登录信息存在 SESSION_DIR，下次免登录
         ctx = p.chromium.launch_persistent_context(
             user_data_dir=SESSION_DIR,
             headless=False,
-            slow_mo=40,
+            slow_mo=30,
             viewport=None,
             args=["--start-maximized"],
         )
@@ -317,85 +356,81 @@ def main():
 
         print("\n" + "=" * 64)
         print("浏览器已打开。请：")
-        print("  1. 如果没登录，登录 Nexonia（之后会被记住，下次免登录）")
-        print("  2. 进入 PO / Approvals 列表页（就是有一堆 PO 的那个表格页）")
-        print("  3. 不用复制任何东西，停在那一页即可")
+        print("  1. 如果没登录，登录 Nexonia（之后会被记住）")
+        print("  2. 进入 PO / Approvals 列表页（有一堆 PO 的那个表格页）")
+        print("  3. 停在那一页即可，不用复制任何东西")
         print("=" * 64)
         input("准备好后按 Enter 开始抓取 ▶ ")
 
-        # ── 找含 PO 的 frame ─────────────────────────────────────────────
         print("\n  正在定位 PO 表格…")
         target = find_target(page)
         if target is None:
-            print("\n❌ 没找到 PO 表格。下面是页面诊断，浏览器保持打开：")
+            print("\n❌ 没找到 PO 表格。浏览器保持打开，下面是诊断：")
             dump_diagnostics(page)
-            input("\n请把上面的输出/截图发给我。看完后按 Enter 关闭 ▶ ")
+            input("\n请把输出/截图发给我。按 Enter 关闭 ▶ ")
             ctx.close()
             return
 
-        # ── Phase 1: 滚动采集 + 几何还原 ──────────────────────────────────
-        print("  正在滚动加载并读取所有 PO…")
-        leaves = collect_all_leaves(target)
+        # ── Phase 1: 一次性读取列表 ──────────────────────────────────────
+        print("  读取 PO 列表…")
+        leaves = capture_list(target)
         records, colx = build_records(leaves)
-
         if not records:
-            print(f"\n❌ 读到了页面文字但没还原出 PO 行。识别到的列：{list(colx)}")
-            print("   浏览器保持打开，下面是诊断：")
+            print(f"\n❌ 没还原出 PO 行。识别到的列：{list(colx)}")
             dump_diagnostics(page)
             input("\n请把输出发给我。按 Enter 关闭 ▶ ")
             ctx.close()
             return
 
         total = len(records)
-        print(f"  ✅ 成功识别 {total} 个 PO")
-        print(f"     示例：{records[0]['po']} | {records[0]['vendor'][:30]} | {records[0]['amount']}")
+        print(f"  ✅ 识别 {total} 个 PO（例：{records[0]['po']} | "
+              f"{records[0]['vendor'][:28]} | {records[0]['amount']}）")
 
-        # ── Phase 2: 逐个打开详情，抓 Cost Center ────────────────────────
-        print(f"\n  开始逐个抓取 Cost Center（共 {total} 个）…")
-        list_url = target.url
-
+        # ── Phase 2: 逐个开弹窗抓 Cost Center ────────────────────────────
+        print(f"\n  开始抓 Cost Center（共 {total} 个）…")
         for i, rec in enumerate(records):
             po = rec["po"]
-            if po in progress:
-                print(f"  [{i+1:>3}/{total}] PO {po}  ✓ 已缓存 ({progress[po].get('cost_center','')})")
+            if po in progress and is_valid_code(progress[po].get("cost_center", "")):
+                print(f"  [{i+1:>3}/{total}] PO {po}  ✓ 缓存 {progress[po]['cost_center']}")
                 continue
 
             cost_center = "NOT_FOUND"
             try:
-                # 点 PO 号（展开或进入详情）
-                loc = target.get_by_text(po, exact=True).first
-                loc.scroll_into_view_if_needed(timeout=5000)
-                loc.click(timeout=5000)
-                time.sleep(1.0)
+                # 点 PO 号打开弹窗
+                target.get_by_text(po, exact=True).first.click(timeout=6000)
 
-                detail_leaves = collect_all_leaves(target)
-                cc = find_cost_center(detail_leaves)
+                # 等弹窗 + 明细加载
+                try:
+                    target.get_by_text("Order Details", exact=False).first.wait_for(timeout=8000)
+                except PWTimeout:
+                    pass
+
+                cc = None
+                for _ in range(3):           # 明细行可能异步加载，重试几次
+                    time.sleep(0.8)
+                    cc = find_cost_center(grab(target)["leaves"])
+                    if cc:
+                        break
                 cost_center = cc if cc else "NOT_FOUND"
 
-                # 第一个 PO：转储详情结构供核对
-                if i == 0:
+                # 第一个 PO 转储详情，便于核对
+                if i == 0 and not cc:
                     with open("output/diagnostic_detail_first.json", "w", encoding="utf-8") as f:
-                        json.dump({"po": po, "cost_center": cc, "leaves": detail_leaves},
+                        json.dump({"po": po, "leaves": grab(target)["leaves"]},
                                   f, ensure_ascii=False, indent=2)
 
-                # 收起 / 返回列表
-                try:
-                    loc2 = target.get_by_text(po, exact=True).first
-                    loc2.click(timeout=2000)   # 再点一次收起（若是内联展开）
-                    time.sleep(0.4)
-                except Exception:
-                    if target.url != list_url:
-                        target.goto(list_url, wait_until="domcontentloaded")
-                        time.sleep(0.6)
+                close_modal(page, target)
 
             except PWTimeout:
                 cost_center = "TIMEOUT"
+                close_modal(page, target)
             except Exception as e:
                 cost_center = "ERROR"
+                close_modal(page, target)
                 if i == 0:
-                    print(f"      （第一个 PO 出错：{e}）")
+                    print(f"      （首个 PO 报错：{e}）")
 
-            mark = "→ " + cost_center if cost_center not in ("NOT_FOUND", "TIMEOUT", "ERROR") else "⚠ " + cost_center
+            mark = ("→ " + cost_center) if is_valid_code(cost_center) else ("⚠ " + cost_center)
             print(f"  [{i+1:>3}/{total}] PO {po}  {mark}")
 
             progress[po] = {**rec, "cost_center": cost_center}
@@ -412,19 +447,20 @@ def main():
             w.writeheader()
             w.writerows(rows)
 
-        bad = [r for r in rows if r.get("cost_center") in ("NOT_FOUND", "TIMEOUT", "ERROR")]
+        bad = [r for r in rows if not is_valid_code(r.get("cost_center", ""))]
         print(f"\n{'='*64}")
         print(f"✅ 完成！输出：{out_csv}")
-        print(f"   {len(rows)} 个 PO，{len(rows)-len(bad)} 个成功拿到 Cost Center")
+        print(f"   {len(rows)} 个 PO，{len(rows)-len(bad)} 个拿到有效 Cost Center")
         if bad:
-            print(f"   ⚠️  {len(bad)} 个没抓到：{[r['po'] for r in bad]}")
-            print("   （详情结构见 output/diagnostic_detail_first.json，发我可优化）")
+            print(f"   ⚠️  {len(bad)} 个没拿到：{[r['po'] for r in bad]}")
+            print("   （重新运行会自动只重试这些；首个失败的详情见 "
+                  "output/diagnostic_detail_first.json）")
         else:
             if os.path.exists(PROGRESS_FILE):
                 os.remove(PROGRESS_FILE)
 
         print(f"\n下一步：python src/process_po_csv.py {out_csv}")
-        input("\n按 Enter 关闭浏览器（登录已记住，下次免登录）▶ ")
+        input("\n按 Enter 关闭浏览器（登录已记住）▶ ")
         ctx.close()
 
 

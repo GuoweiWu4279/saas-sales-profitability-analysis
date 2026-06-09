@@ -35,6 +35,12 @@ def load_csv(csv_path):
     if "COST_CENTER" in df.columns and "PROGRAM_CODE" not in df.columns:
         df = df.rename(columns={"COST_CENTER": "PROGRAM_CODE"})
 
+    # 一个 PO 可能有多个 Cost Center（用 ; 连接），取第一个作 Program Code 做映射
+    if "PROGRAM_CODE" in df.columns:
+        df["PROGRAM_CODE"] = df["PROGRAM_CODE"].apply(
+            lambda v: str(v).split(";")[0].strip() if v else v
+        )
+
     return df
 
 
