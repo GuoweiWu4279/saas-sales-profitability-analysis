@@ -1,0 +1,13 @@
+# Playwright 持久化登录数据（含敏感会话，不要提交）
+.nexonia_session/
+
+# 抓取进度缓存与诊断文件
+output/.scrape_progress.json
+output/diagnostic_*.json
+output/diagnostic_*.png
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
