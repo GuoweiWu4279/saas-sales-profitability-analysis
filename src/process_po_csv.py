@@ -125,15 +125,21 @@ def reviewer_for(code, mapping, level):
     return m["l1"] or m["l2"]
 
 
+def levels_for(code, mapping):
+    """返回 (1st, 2nd)。找不到返回 ('', '')。"""
+    m = mapping.get(norm(code))
+    return (m["l1"], m["l2"]) if m else ("", "")
+
+
 # ── 3. 写 Excel tracking 表（纯值）──────────────────────────────────────────
 def write_excel(df, mapping, level, excel_path, po_sheet):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = po_sheet
 
-    headers = ["PO Number", "Program Code", "Reviewer", "Status",
-               "Creation Date", "Vendor", "Total Amount", "Memo"]
-    widths = [11, 16, 16, 10, 14, 40, 13, 50]
+    headers = ["PO Number", "Program Code", "Reviewer 1st", "Reviewer 2nd",
+               "Status", "Creation Date", "Vendor", "Total Amount", "Memo"]
+    widths = [11, 16, 16, 16, 10, 14, 40, 13, 50]
     for col, (h, w) in enumerate(zip(headers, widths), 1):
         c = ws.cell(1, col, h)
         c.font = Font(bold=True, color="FFFFFF")
@@ -143,13 +149,15 @@ def write_excel(df, mapping, level, excel_path, po_sheet):
 
     for i, (_, row) in enumerate(df.iterrows(), start=2):
         code = row.get("PROGRAM_CODE", "")
+        l1, l2 = levels_for(code, mapping)
         ws.cell(i, 1, row.get("PO_NUMBER", ""))
         ws.cell(i, 2, code)
-        ws.cell(i, 3, reviewer_for(code, mapping, level))
-        ws.cell(i, 5, row.get("CREATION_DATE", ""))
-        ws.cell(i, 6, row.get("VENDOR", ""))
-        ws.cell(i, 7, row.get("TOTAL_AMOUNT", ""))
-        ws.cell(i, 8, row.get("MEMO", ""))
+        ws.cell(i, 3, l1)
+        ws.cell(i, 4, l2)
+        ws.cell(i, 6, row.get("CREATION_DATE", ""))
+        ws.cell(i, 7, row.get("VENDOR", ""))
+        ws.cell(i, 8, row.get("TOTAL_AMOUNT", ""))
+        ws.cell(i, 9, row.get("MEMO", ""))
     ws.freeze_panes = "A2"
 
     os.makedirs(os.path.dirname(excel_path) or ".", exist_ok=True)
@@ -236,6 +244,19 @@ def main():
         month_year = po_sheet
 
     write_excel(df, mapping, level, f"output/PO_Tracking_{po_sheet}.xlsx", po_sheet)
+
+    # 汇总表：每个 PO 的 1st / 2nd reviewer 一览
+    print(f"\n{'='*72}")
+    print(f"{'PO':<8}{'Program Code':<18}{'1st level':<20}{'2nd level':<20}")
+    print("-" * 72)
+    for _, row in df.iterrows():
+        code = row.get("PROGRAM_CODE", "")
+        l1, l2 = levels_for(code, mapping)
+        l1 = l1 or "❓未找到"
+        l2 = l2 or "—"
+        print(f"{row.get('PO_NUMBER',''):<8}{code:<18}{l1:<20}{l2:<20}")
+    print("=" * 72)
+
     generate_emails(df, mapping, level, month_year)
 
 
